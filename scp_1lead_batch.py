@@ -1,27 +1,24 @@
 # scp_1lead_batch.py
 # 批次讀取資料夾內的 1 導程 SCP-ECG（假設 Section6 為未壓縮 int16-LE）
-# 以數字自然排序處理 (1.SCP, 2.SCP, 3.SCP ...)，輸出：
-# 1) 每檔 CSV
-# 2) 每檔簡單預覽 PNG（前 PREVIEW_SECONDS 秒）
-# 3) 每檔「三行排列」PNG（白底、含 grid，不用粉色背景），並顯示心跳（BPM）
+# 每個檔案獨立處理：輸出 CSV、單檔預覽、三行圖（並顯示三方法平均心率 BPM）
 
 import sys, os, glob
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, butter, filtfilt
 
 # === 檔案結構（依你的裝置批次而定） ===
 SEC6_OFF = 173
 SEC6_LEN = 9024
 
 # === 取樣率 & 單位 ===
-FS = 150  # 你現在設定的取樣率（如需對齊官方軟體可改 250/500）
-MICROVOLT_PER_LSB = None  # 例：4.88；未知就 None（輸出 LSB）
+FS = 150                 # 如需對齊官方軟體可改 250/500
+MICROVOLT_PER_LSB = None # 例：4.88；未知就 None（輸出 LSB）
 
 # === 圖表參數 ===
-PREVIEW_SECONDS = 10          # 單檔 preview 的秒數
-THREEROW_SECONDS_PER_ROW = 10 # 三行圖：每一行顯示幾秒
-THREEROW_ROWS = 3             # 固定三行
+PREVIEW_SECONDS = 30
+THREEROW_SECONDS_PER_ROW = 10  # 三行圖每行秒數
+THREEROW_ROWS = 3              # 固定三行
 LINE_WIDTH = 0.9
 
 def natural_key_for_scp(path):
@@ -40,35 +37,50 @@ def read_section6_1lead(filepath):
     if len(sec6) != SEC6_LEN:
         raise RuntimeError(f"[{os.path.basename(filepath)}] Section 6 長度不符，請檢查 SEC6_OFF/SEC6_LEN。")
 
-    sig = np.frombuffer(sec6, dtype="<i2")  # (samples,)
-    n = sig.size
-    t = np.arange(n) / float(FS)
-
+    sig = np.frombuffer(sec6, dtype="<i2").astype(np.float64)
     # 去基線漂移（簡單中位數）
-    sig_f = sig.astype(np.float64)
-    sig_f -= np.median(sig_f)
+    sig -= np.median(sig)
 
     unit = "LSB"
     if MICROVOLT_PER_LSB is not None:
-        sig_f = sig_f * (MICROVOLT_PER_LSB / 1000.0)  # μV -> mV
+        sig *= (MICROVOLT_PER_LSB / 1000.0)  # μV -> mV
         unit = "mV"
 
-    return t, sig_f, unit
+    n = sig.size
+    t = np.arange(n) / float(FS)
+    return t, sig, unit
 
+# ====== 心率：三方法取平均（只回傳平均，不列印各方法） ======
 def calc_heart_rate(sig, fs):
-    """利用簡單 R 波峰值檢測計算心跳（BPM）"""
-    # 取絕對值並平滑
+    """回傳三種方法的平均 BPM；若全失敗回傳 None"""
+    bpm_raw      = _calc_bpm(sig, fs)
+    bpm_butter   = _calc_bpm(_butter_bandpass(sig, fs, 5, 15), fs)
+    bpm_smoothed = _calc_bpm(_moving_avg(sig, fs, 0.10), fs)
+    print(f"心率：原始={bpm_raw:.1f} bpm, Butter={bpm_butter:.1f} bpm, 平滑={bpm_smoothed:.1f} bpm")
+    vals = [b for b in (bpm_raw, bpm_butter, bpm_smoothed) if b is not None]
+    return float(np.mean(vals)) if vals else None
+
+def _calc_bpm(sig, fs):
     sig_abs = np.abs(sig)
-    # 偵測門檻：均值 + 0.5 標準差
     thresh = np.mean(sig_abs) + 0.5 * np.std(sig_abs)
-    peaks, _ = find_peaks(sig_abs, height=thresh, distance=int(0.4 * fs))  # 至少 0.4s 間隔
+    peaks, _ = find_peaks(sig_abs, height=thresh, distance=int(0.4 * fs))
     if len(peaks) < 2:
         return None
-    rr_intervals = np.diff(peaks) / fs
-    mean_rr = np.mean(rr_intervals)
-    bpm = 60.0 / mean_rr
-    return bpm
+    rr = np.diff(peaks) / fs
+    mean_rr = float(np.mean(rr))
+    return 60.0 / mean_rr if mean_rr > 0 else None
 
+def _butter_bandpass(x, fs, low, high, order=2):
+    nyq = fs / 2.0
+    b, a = butter(order, [low/nyq, high/nyq], btype="bandpass")
+    return filtfilt(b, a, x)
+
+def _moving_avg(x, fs, win_sec):
+    w = max(3, int(round(win_sec * fs)))
+    k = np.ones(w) / w
+    return np.convolve(x, k, mode="same")
+
+# ====== 輸出 ======
 def save_per_file_outputs(out_dir, stem, t, sig, unit):
     os.makedirs(out_dir, exist_ok=True)
     out_csv = os.path.join(out_dir, f"{stem}_1lead.csv")
@@ -78,7 +90,7 @@ def save_per_file_outputs(out_dir, stem, t, sig, unit):
     m = np.column_stack([t, sig])
     np.savetxt(out_csv, m, delimiter=",", header=f"time,{unit}", comments="", fmt="%.6f")
 
-    # 單檔預覽（限定 PREVIEW_SECONDS）
+    # 單檔預覽（前 PREVIEW_SECONDS 秒）
     max_idx = len(t)
     if PREVIEW_SECONDS is not None and len(t) > 1:
         duration = t[-1]
@@ -99,49 +111,46 @@ def save_per_file_outputs(out_dir, stem, t, sig, unit):
 
 def save_three_row_plot(out_dir, stem, t, sig, unit):
     """
-    生成「三行排列」的圖。白底、有 grid，不用粉色紙格。
-    顯示心跳 BPM。
+    每個檔案各自畫三行圖（連續三段，每段 THREEROW_SECONDS_PER_ROW 秒）。
+    BPM 以「三行所涵蓋的訊號」計算（較貼近畫面）。
     """
     os.makedirs(out_dir, exist_ok=True)
-    total_rows = THREEROW_ROWS
-    sec_per_row = THREEROW_SECONDS_PER_ROW
-    N = len(t)
-    if N < 2 or t[-1] <= 0:
-        return None
-    est_fs = (len(t)-1) / t[-1]
-    samples_per_row = int(round(sec_per_row * est_fs))
-    if samples_per_row <= 0:
+    if len(t) < 2 or t[-1] <= 0:
         return None
 
-    # 計算全圖 y 範圍
-    y_min = np.nanmin(sig)
-    y_max = np.nanmax(sig)
+    est_fs = (len(t)-1) / t[-1]
+    samples_per_row = int(round(THREEROW_SECONDS_PER_ROW * est_fs))
+    total_need = samples_per_row * THREEROW_ROWS
+    # 如果資料不足三行，就取能取的部分
+    use_sig = sig[:min(len(sig), total_need)]
+    # 用三行所顯示的訊號來估 BPM
+    bpm = calc_heart_rate(use_sig, FS)
+    bpm_text = f"   HR≈{bpm:.1f} bpm" if bpm is not None else ""
+
+    # y 範圍
+    y_min, y_max = np.nanmin(use_sig), np.nanmax(use_sig)
     if not np.isfinite(y_min) or not np.isfinite(y_max) or y_min == y_max:
         y_min, y_max = -1.0, 1.0
 
-    # 計算心跳
-    bpm = calc_heart_rate(sig, FS)
-    bpm_text = f" | Heart Rate: {bpm:.1f} BPM" if bpm else ""
-
-    # 畫三行
     fig = plt.figure(figsize=(10, 7.5))
-    fig.suptitle(f"{stem}  |  {sec_per_row}s x {total_rows} rows   (FS={FS}Hz, unit={unit}){bpm_text}", fontsize=11)
+    fig.suptitle(f"{stem}  |  {THREEROW_SECONDS_PER_ROW}s x {THREEROW_ROWS} rows   (FS={FS}Hz, unit={unit}){bpm_text}",
+                 fontsize=11)
 
-    for r in range(total_rows):
-        ax = fig.add_subplot(total_rows, 1, r+1)
+    for r in range(THREEROW_ROWS):
+        ax = fig.add_subplot(THREEROW_ROWS, 1, r+1)
         s = r * samples_per_row
-        e = min(N, s + samples_per_row)
+        e = min(len(sig), s + samples_per_row)
         if s >= e:
             ax.axis("off")
             continue
-        tt = t[s:e] - t[s]
+        tt = (np.arange(e - s) / float(FS))  # 每行從 0 s 起算
         yy = sig[s:e]
         ax.plot(tt, yy, linewidth=LINE_WIDTH)
         ax.set_ylim(y_min, y_max)
         ax.grid(True, linewidth=0.5, alpha=0.6)
         ax.set_ylabel(unit)
-        ax.set_xlim(0, max(tt) if len(tt) else sec_per_row)
-        if r == total_rows - 1:
+        ax.set_xlim(0, THREEROW_SECONDS_PER_ROW if e - s > 0 else 1.0)
+        if r == THREEROW_ROWS - 1:
             ax.set_xlabel("Time (s)")
         else:
             ax.set_xticklabels([])
@@ -153,14 +162,13 @@ def save_three_row_plot(out_dir, stem, t, sig, unit):
     return out_png
 
 def main(folder):
-    pattern1 = os.path.join(folder, "*.SCP")
-    pattern2 = os.path.join(folder, "*.scp")
-    files = glob.glob(pattern1) + glob.glob(pattern2)
+    files = sorted(glob.glob(os.path.join(folder, "*.SCP")) +
+                   glob.glob(os.path.join(folder, "*.scp")),
+                   key=natural_key_for_scp)
     if not files:
         print("資料夾內找不到 .SCP 檔。")
         return
 
-    files = sorted(files, key=natural_key_for_scp)
     out_dir = os.path.join(folder, "_out")
     os.makedirs(out_dir, exist_ok=True)
 
